@@ -1,0 +1,255 @@
+name: Build Native FullScreen IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    permissions:
+      contents: write 
+
+    steps:
+      - name: 1. 检出代码
+        uses: actions/checkout@v4
+
+      - name: 2. 规整最新工程目录
+        run: |
+          # 解压仓库中可能存在的 zip 包
+          find . -maxdepth 2 -iname "*.zip" -exec unzip -o -q "{}" \;
+
+          # 自动寻找最新的 .swiftpm 目录
+          TARGET_DIR=""
+          while IFS= read -r pkg_file; do
+            DIR=$(dirname "$pkg_file")
+            if [ -z "$TARGET_DIR" ] || [ "$pkg_file" -nt "$TARGET_DIR/Package.swift" ]; then
+              TARGET_DIR="$DIR"
+            fi
+          done < <(find . -name "Package.swift" -not -path "*/.*")
+
+          if [ -z "$TARGET_DIR" ]; then
+            echo "❌ 未找到 Package.swift 目录"
+            exit 1
+          fi
+          echo "✅ 锁定工程目录: $TARGET_DIR"
+          
+          rm -rf AppSource
+          mv "$TARGET_DIR" AppSource
+
+      - name: 3. 校准真机屏幕缩放比例与 SDK 兼容层
+        run: |
+          # (1) 将 SystemEnv 中的 1.16 强行放大改为 1.0 原生 1:1 比例，防止真机 UI 撑爆
+          SYS_ENV_FILE=$(find AppSource -name "SystemEnv*.swift" | head -n 1)
+          if [ -n "$SYS_ENV_FILE" ]; then
+            sed -i '' 's/return isPhone ? 1.16 : 1.0/return 1.0/g' "$SYS_ENV_FILE"
+            echo "✅ 已校准真机 1:1 原生分辨率缩放比"
+          fi
+
+          # (2) 检查当前云端 Xcode 是否内置 iOS 26 SDK，若处于 Xcode 16 (iOS 18 SDK) 则挂载零侵入兼容垫片
+          SDK_VER=$(xcodebuild -showsdks | grep iphoneos | awk '{print $NF}' | head -n 1)
+          echo "当前云端 SDK: $SDK_VER"
+          if [[ "$SDK_VER" == *"18."* ]]; then
+            cat << 'EOF' > AppSource/IOS26CompatibilityShim.swift
+            import SwiftUI
+
+            public struct GlassEffectStyle: Sendable, Equatable {
+                public var isInteractive: Bool = false
+                public var isClear: Bool = false
+                public static let regular = GlassEffectStyle(isInteractive: false, isClear: false)
+                public static let clear = GlassEffectStyle(isInteractive: false, isClear: true)
+                public func interactive(_ val: Bool = true) -> GlassEffectStyle {
+                    var copy = self; copy.isInteractive = val; return copy
+                }
+            }
+
+            public enum LiquidGlassShape: Equatable {
+                case capsule, circle, rect(cornerRadius: CGFloat)
+            }
+
+            public struct ScrollEdgeEffectStyle: Sendable, Equatable {
+                public static let soft = ScrollEdgeEffectStyle()
+                public static let hard = ScrollEdgeEffectStyle()
+                public static let automatic = ScrollEdgeEffectStyle()
+            }
+
+            public extension View {
+                @ViewBuilder
+                func safeAreaBar<V: View>(edge: VerticalEdge = .bottom, alignment: Alignment = .center, spacing: CGFloat? = nil, @ViewBuilder content: @escaping () -> V) -> some View {
+                    self.safeAreaInset(edge: edge, alignment: alignment.horizontal, spacing: spacing) { content() }
+                }
+
+                @ViewBuilder
+                func scrollEdgeEffectStyle(_ style: ScrollEdgeEffectStyle = .soft, for edge: VerticalEdge = .bottom) -> some View { self }
+
+                @ViewBuilder
+                func glassEffect(_ style: GlassEffectStyle = .regular, in glassShape: LiquidGlassShape) -> some View {
+                    switch glassShape {
+                    case .capsule: self.background(.ultraThinMaterial, in: Capsule())
+                    case .circle: self.background(.ultraThinMaterial, in: Circle())
+                    case .rect(let r): self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: r, style: .continuous))
+                    }
+                }
+
+                @ViewBuilder
+                func glassEffect<S: InsettableShape>(_ style: GlassEffectStyle = .regular, in shape: S) -> some View {
+                    self.background(.ultraThinMaterial, in: shape)
+                }
+            }
+
+            public struct GlassEffectContainer<Content: View>: View {
+                public let spacing: CGFloat
+                @ViewBuilder public let content: () -> Content
+                public init(spacing: CGFloat = 8, @ViewBuilder content: @escaping () -> Content) {
+                    self.spacing = spacing; self.content = content
+                }
+                public var body: some View { content() }
+            }
+
+            public extension ToolbarItem {
+                func sharedBackgroundVisibility(_ visibility: Visibility) -> some ToolbarContent { self }
+            }
+            EOF
+            echo "✅ 已挂载纯净版原生毛玻璃垫片（无多余外框污染）"
+          fi
+
+      - name: 4. 编译并封装原生全面屏 IPA
+        run: |
+          cd AppSource
+          SCHEME=$(xcodebuild -list 2>/dev/null | awk '/Schemes:/{flag=1;next} flag && NF{print $1; exit}')
+          if [ -z "$SCHEME" ]; then SCHEME="幼刀"; fi
+          echo "🚀 正在编译 Scheme: $SCHEME"
+
+          set +e
+          xcodebuild build \
+            -scheme "$SCHEME" \
+            -destination "generic/platform=iOS" \
+            -configuration Release \
+            -derivedDataPath ./build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" > build.log 2>&1
+          
+          BUILD_STATUS=$?
+          if [ $BUILD_STATUS -ne 0 ]; then
+            echo "==================== [ 编译错误详情 ] ===================="
+            grep -E "error:" build.log | head -n 30
+            echo "=========================================================="
+            exit $BUILD_STATUS
+          fi
+          set -e
+
+          PRODUCTS_DIR=$(find ./build -type d -path "*/Build/Products/Release-iphoneos" | head -n 1)
+          echo "✅ 产物目录: $PRODUCTS_DIR"
+
+          mkdir -p Payload/YouDao.app
+
+          # 1. 拷贝二进制主程序（排除 .dSYM 等文件夹）
+          APP_BIN=$(find "$PRODUCTS_DIR" -maxdepth 1 -type f -perm +111 ! -name "*.*" ! -name ".*" | head -n 1)
+          if [ -z "$APP_BIN" ]; then
+            APP_BIN=$(find "$PRODUCTS_DIR" -name "幼刀" -o -name "AppModule" | head -n 1)
+          fi
+          echo "✅ 锁定可执行文件: $APP_BIN"
+          cp "$APP_BIN" Payload/YouDao.app/YouDao
+          chmod +x Payload/YouDao.app/YouDao
+
+          # 2. 拷贝资源 Bundle
+          find "$PRODUCTS_DIR" -maxdepth 1 -type d -name "*.bundle" | while read -r bndl; do
+            cp -R "$bndl/"* Payload/YouDao.app/ 2>/dev/null || true
+          done
+
+          # 3. 使用 actool 正式编译 Assets.xcassets（生成 AppIcon 与 Assets.car）
+          ASSETS_DIR=$(find . -maxdepth 2 -name "Assets.xcassets" | head -n 1)
+          if [ -n "$ASSETS_DIR" ]; then
+            echo "🎨 正在编译应用图标与素材库: $ASSETS_DIR"
+            xcrun actool "$ASSETS_DIR" \
+              --compile Payload/YouDao.app \
+              --platform iphoneos \
+              --minimum-deployment-target 18.0 \
+              --app-icon AppIcon \
+              --output-partial-info-plist partial_assetcatalog.plist || true
+          fi
+
+          # 4. 生成完整版原生全屏 Info.plist（彻底解决画面放大百倍与黑边 Bug！）
+          cat << 'EOF' > Payload/YouDao.app/Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>zh_CN</string>
+              <key>CFBundleDisplayName</key>
+              <string>幼刀</string>
+              <key>CFBundleExecutable</key>
+              <string>YouDao</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.kunoouc.youdao</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>幼刀</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>MinimumOSVersion</key>
+              <string>17.0</string>
+              <!-- 🌟 核心1：声明支持 iPhone (1) 与 iPad (2) 全面屏分辨率 -->
+              <key>UIDeviceFamily</key>
+              <array>
+                  <integer>1</integer>
+                  <integer>2</integer>
+              </array>
+              <!-- 🌟 核心2：必须包含 UILaunchScreen 字典，否则 iOS 会强制回退到 320x480 放大模式！ -->
+              <key>UILaunchScreen</key>
+              <dict>
+                  <key>UIColorName</key>
+                  <string></string>
+              </dict>
+              <key>UIRequiredDeviceCapabilities</key>
+              <array>
+                  <string>arm64</string>
+              </array>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>UISupportedInterfaceOrientations~ipad</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+                  <string>UIInterfaceOrientationPortraitUpsideDown</string>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <!-- 🌟 核心3：相册选图权限声明，防止真机换壁纸/换头像闪退 -->
+              <key>NSPhotoLibraryUsageDescription</key>
+              <string>需要访问您的相册以自定义桌面壁纸、小组件配图与聊天头像</string>
+          </dict>
+          </plist>
+          EOF
+
+          # 如果 actool 生成了图标配置，合并进 Info.plist
+          if [ -f "partial_assetcatalog.plist" ]; then
+            /usr/libexec/PlistBuddy -x -c "Merge partial_assetcatalog.plist" Payload/YouDao.app/Info.plist || true
+          fi
+
+          # 将 Info.plist 转换为标准二进制格式
+          plutil -convert binary1 Payload/YouDao.app/Info.plist
+
+          # 5. 打包输出 IPA
+          zip -qry YouDao.ipa Payload
+          mv YouDao.ipa "$GITHUB_WORKSPACE/YouDao.ipa"
+          echo "🎉 全屏高刷原画质 IPA 打包完成！"
+
+      - name: 5. 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "幼刀 原生全屏版 IPA (Build ${{ github.run_number }})"
+          files: YouDao.ipa
+          token: ${{ secrets.GITHUB_TOKEN }}

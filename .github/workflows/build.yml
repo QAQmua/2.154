@@ -36,74 +36,75 @@ jobs:
           rm -rf AppSource
           mv "$TARGET_DIR" AppSource
 
-      - name: 3. 注入 SDK 兼容层 (保留原 UI 比例，修复 EOF 报错)
+      - name: 3. 挂载 SDK 兼容层（完全保留原版 1.16 与全部代码）
         run: |
-          SDK_VER=$(xcodebuild -showsdks | grep iphoneos | awk '{print $NF}' | head -n 1)
-          echo "当前云端 SDK: $SDK_VER"
-          if [[ "$SDK_VER" == *"18."* ]]; then
-            # 注意：这里的代码和 EOF 必须顶格写，不能有前置空格！
-            cat << 'EOF' > AppSource/IOS26CompatibilityShim.swift
-import SwiftUI
+          python3 -c '
+          import os
 
-public struct GlassEffectStyle: Sendable, Equatable {
-    public var isInteractive: Bool = false
-    public var isClear: Bool = false
-    public static let regular = GlassEffectStyle(isInteractive: false, isClear: false)
-    public static let clear = GlassEffectStyle(isInteractive: false, isClear: true)
-    public func interactive(_ val: Bool = true) -> GlassEffectStyle {
-        var copy = self; copy.isInteractive = val; return copy
-    }
-}
+          code = """import SwiftUI
 
-public enum LiquidGlassShape: Equatable {
-    case capsule, circle, rect(cornerRadius: CGFloat)
-}
+          public struct GlassEffectStyle: Sendable, Equatable {
+              public var isInteractive: Bool = false
+              public var isClear: Bool = false
+              public static let regular = GlassEffectStyle(isInteractive: false, isClear: false)
+              public static let clear = GlassEffectStyle(isInteractive: false, isClear: true)
+              public func interactive(_ val: Bool = true) -> GlassEffectStyle {
+                  var copy = self; copy.isInteractive = val; return copy
+              }
+          }
 
-public struct ScrollEdgeEffectStyle: Sendable, Equatable {
-    public static let soft = ScrollEdgeEffectStyle()
-    public static let hard = ScrollEdgeEffectStyle()
-    public static let automatic = ScrollEdgeEffectStyle()
-}
+          public enum LiquidGlassShape: Equatable {
+              case capsule, circle, rect(cornerRadius: CGFloat)
+          }
 
-public extension View {
-    @ViewBuilder
-    func safeAreaBar<V: View>(edge: VerticalEdge = .bottom, alignment: Alignment = .center, spacing: CGFloat? = nil, @ViewBuilder content: @escaping () -> V) -> some View {
-        self.safeAreaInset(edge: edge, alignment: alignment.horizontal, spacing: spacing) { content() }
-    }
+          public struct ScrollEdgeEffectStyle: Sendable, Equatable {
+              public static let soft = ScrollEdgeEffectStyle()
+              public static let hard = ScrollEdgeEffectStyle()
+              public static let automatic = ScrollEdgeEffectStyle()
+          }
 
-    @ViewBuilder
-    func scrollEdgeEffectStyle(_ style: ScrollEdgeEffectStyle = .soft, for edge: VerticalEdge = .bottom) -> some View { self }
+          public extension View {
+              @ViewBuilder
+              func safeAreaBar<V: View>(edge: VerticalEdge = .bottom, alignment: Alignment = .center, spacing: CGFloat? = nil, @ViewBuilder content: @escaping () -> V) -> some View {
+                  self.safeAreaInset(edge: edge, alignment: alignment.horizontal, spacing: spacing) { content() }
+              }
 
-    @ViewBuilder
-    func glassEffect(_ style: GlassEffectStyle = .regular, in glassShape: LiquidGlassShape) -> some View {
-        switch glassShape {
-        case .capsule: self.background(.ultraThinMaterial, in: Capsule())
-        case .circle: self.background(.ultraThinMaterial, in: Circle())
-        case .rect(let r): self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: r, style: .continuous))
-        }
-    }
+              @ViewBuilder
+              func scrollEdgeEffectStyle(_ style: ScrollEdgeEffectStyle = .soft, for edge: VerticalEdge = .bottom) -> some View { self }
 
-    @ViewBuilder
-    func glassEffect<S: InsettableShape>(_ style: GlassEffectStyle = .regular, in shape: S) -> some View {
-        self.background(.ultraThinMaterial, in: shape)
-    }
-}
+              @ViewBuilder
+              func glassEffect(_ style: GlassEffectStyle = .regular, in glassShape: LiquidGlassShape) -> some View {
+                  switch glassShape {
+                  case .capsule: self.background(.ultraThinMaterial, in: Capsule())
+                  case .circle: self.background(.ultraThinMaterial, in: Circle())
+                  case .rect(let r): self.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: r, style: .continuous))
+                  }
+              }
 
-public struct GlassEffectContainer<Content: View>: View {
-    public let spacing: CGFloat
-    @ViewBuilder public let content: () -> Content
-    public init(spacing: CGFloat = 8, @ViewBuilder content: @escaping () -> Content) {
-        self.spacing = spacing; self.content = content
-    }
-    public var body: some View { content() }
-}
+              @ViewBuilder
+              func glassEffect<S: InsettableShape>(_ style: GlassEffectStyle = .regular, in shape: S) -> some View {
+                  self.background(.ultraThinMaterial, in: shape)
+              }
+          }
 
-public extension ToolbarItem {
-    func sharedBackgroundVisibility(_ visibility: Visibility) -> some ToolbarContent { self }
-}
-EOF
-            echo "✅ 已挂载纯净版原生毛玻璃垫片（无多余外框污染）"
-          fi
+          public struct GlassEffectContainer<Content: View>: View {
+              public let spacing: CGFloat
+              @ViewBuilder public let content: () -> Content
+              public init(spacing: CGFloat = 8, @ViewBuilder content: @escaping () -> Content) {
+                  self.spacing = spacing; self.content = content
+              }
+              public var body: some View { content() }
+          }
+
+          public extension ToolbarItem {
+              func sharedBackgroundVisibility(_ visibility: Visibility) -> some ToolbarContent { self }
+          }
+          """
+
+          with open("AppSource/IOS26CompatibilityShim.swift", "w") as f:
+              f.write(code)
+          '
+          echo "✅ 兼容垫片注入成功！已完整保留你的 1.16 比例与原始代码！"
 
       - name: 4. 编译并封装原生全面屏 IPA
         run: |
@@ -150,10 +151,10 @@ EOF
             cp -R "$bndl/"* Payload/YouDao.app/ 2>/dev/null || true
           done
 
-          # 3. 编译 Assets.xcassets (图标与素材)
+          # 3. 编译应用图标与资源库
           ASSETS_DIR=$(find . -maxdepth 2 -name "Assets.xcassets" | head -n 1)
           if [ -n "$ASSETS_DIR" ]; then
-            echo "🎨 正在编译应用图标与素材库: $ASSETS_DIR"
+            echo "🎨 正在编译素材库: $ASSETS_DIR"
             xcrun actool "$ASSETS_DIR" \
               --compile Payload/YouDao.app \
               --platform iphoneos \
@@ -162,79 +163,81 @@ EOF
               --output-partial-info-plist partial_assetcatalog.plist || true
           fi
 
-          # 4. 写入全屏标准 Info.plist
-          cat << 'EOF' > Payload/YouDao.app/Info.plist
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>zh_CN</string>
-    <key>CFBundleDisplayName</key>
-    <string>幼刀</string>
-    <key>CFBundleExecutable</key>
-    <string>YouDao</string>
-    <key>CFBundleIdentifier</key>
-    <string>com.kunoouc.youdao</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>幼刀</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSRequiresIPhoneOS</key>
-    <true/>
-    <key>MinimumOSVersion</key>
-    <string>17.0</string>
-    <key>UIDeviceFamily</key>
-    <array>
-        <integer>1</integer>
-        <integer>2</integer>
-    </array>
-    <key>UILaunchScreen</key>
-    <dict>
-        <key>UIColorName</key>
-        <string></string>
-    </dict>
-    <key>UIRequiredDeviceCapabilities</key>
-    <array>
-        <string>arm64</string>
-    </array>
-    <key>UISupportedInterfaceOrientations</key>
-    <array>
-        <string>UIInterfaceOrientationPortrait</string>
-        <string>UIInterfaceOrientationLandscapeLeft</string>
-        <string>UIInterfaceOrientationLandscapeRight</string>
-    </array>
-    <key>UISupportedInterfaceOrientations~ipad</key>
-    <array>
-        <string>UIInterfaceOrientationPortrait</string>
-        <string>UIInterfaceOrientationPortraitUpsideDown</string>
-        <string>UIInterfaceOrientationLandscapeLeft</string>
-        <string>UIInterfaceOrientationLandscapeRight</string>
-    </array>
-    <key>NSPhotoLibraryUsageDescription</key>
-    <string>需要访问您的相册以自定义桌面壁纸、小组件配图与聊天头像</string>
-</dict>
-</plist>
-EOF
+          # 4. 生成原生全面屏 Info.plist（核心：解决放大的罪魁祸首）
+          python3 -c '
+          plist_content = """<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDevelopmentRegion</key>
+              <string>zh_CN</string>
+              <key>CFBundleDisplayName</key>
+              <string>幼刀</string>
+              <key>CFBundleExecutable</key>
+              <string>YouDao</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.kunoouc.youdao</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>幼刀</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>MinimumOSVersion</key>
+              <string>17.0</string>
+              <key>UIDeviceFamily</key>
+              <array>
+                  <integer>1</integer>
+                  <integer>2</integer>
+              </array>
+              <key>UILaunchScreen</key>
+              <dict>
+                  <key>UIColorName</key>
+                  <string></string>
+              </dict>
+              <key>UIRequiredDeviceCapabilities</key>
+              <array>
+                  <string>arm64</string>
+              </array>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>UISupportedInterfaceOrientations~ipad</key>
+              <array>
+                  <string>UIInterfaceOrientationPortrait</string>
+                  <string>UIInterfaceOrientationPortraitUpsideDown</string>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+              </array>
+              <key>NSPhotoLibraryUsageDescription</key>
+              <string>需要访问您的相册以自定义桌面壁纸、小组件配图与聊天头像</string>
+          </dict>
+          </plist>
+          """
+          with open("Payload/YouDao.app/Info.plist", "w") as f:
+              f.write(plist_content)
+          '
 
           # 合并图标配置
           if [ -f "partial_assetcatalog.plist" ]; then
             /usr/libexec/PlistBuddy -x -c "Merge partial_assetcatalog.plist" Payload/YouDao.app/Info.plist || true
           fi
 
-          # 转为二进制格式
           plutil -convert binary1 Payload/YouDao.app/Info.plist
 
-          # 5. 打包输出
+          # 5. 打包输出 IPA
           zip -qry YouDao.ipa Payload
           mv YouDao.ipa "$GITHUB_WORKSPACE/YouDao.ipa"
-          echo "🎉 全屏高刷原画质 IPA 打包完成！"
+          echo "🎉 原生全屏 IPA 打包完成！"
 
       - name: 5. 发布到 GitHub Release
         uses: softprops/action-gh-release@v2
